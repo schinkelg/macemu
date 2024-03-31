@@ -276,7 +276,7 @@ void SysAddFloppyPrefs(void)
 		struct dirent *floppy_dev;
 		while ((floppy_dev = readdir(fd_dir)) != NULL) {
 			if (strstr(floppy_dev->d_name, "u1440") != NULL) {
-				char fd_dev[20];
+				char fd_dev[268];
 				sprintf(fd_dev, "/dev/floppy/%s", floppy_dev->d_name);
 				PrefsAddString("floppy", fd_dev);
 			}
@@ -339,7 +339,7 @@ void SysAddCDROMPrefs(void)
 			struct dirent *cdrom_dev;
 			while ((cdrom_dev = readdir(cd_dir)) != NULL) {
 				if (strcmp(cdrom_dev->d_name, ".") != 0 && strcmp(cdrom_dev->d_name, "..") != 0) {
-					char cd_dev[20];
+					char cd_dev[268];
 					sprintf(cd_dev, "/dev/cdroms/%s", cdrom_dev->d_name);
 					PrefsAddString("cdrom", cd_dev);
 				}
