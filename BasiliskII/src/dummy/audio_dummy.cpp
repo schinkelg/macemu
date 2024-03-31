@@ -34,7 +34,7 @@
 void AudioInit(void)
 {
 	// Init audio status and feature flags
-	AudioStatus.sample_rate = 44100 << 16;
+	AudioStatus.sample_rate = 44100u << 16;
 	AudioStatus.sample_size = 16;
 	AudioStatus.channels = 2;
 	AudioStatus.mixer = 0;
@@ -42,7 +42,7 @@ void AudioInit(void)
 	audio_component_flags = cmpWantsRegisterMessage | kStereoOut | k16BitOut;
 
 	// Only one sample format is supported
-	audio_sample_rates.push_back(44100 << 16);
+	audio_sample_rates.push_back(44100u << 16);
 	audio_sample_sizes.push_back(16);
 	audio_channel_counts.push_back(2);
 

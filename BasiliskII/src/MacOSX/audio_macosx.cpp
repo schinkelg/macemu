@@ -90,7 +90,7 @@ void AudioInit(void)
 	
 	audio_sample_rates.push_back(11025 << 16);
 	audio_sample_rates.push_back(22050 << 16);
-	audio_sample_rates.push_back(44100 << 16);
+	audio_sample_rates.push_back(44100u << 16);
 
 	// Default to highest supported values
 	audio_sample_rate_index   = audio_sample_rates.size() - 1;

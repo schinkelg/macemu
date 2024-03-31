@@ -115,7 +115,7 @@ bool open_audio(void)
 		audio_sample_rates.push_back( 8000 << 16);
 		audio_sample_rates.push_back(11025 << 16);
 		audio_sample_rates.push_back(22050 << 16);
-		audio_sample_rates.push_back(44100 << 16);
+		audio_sample_rates.push_back(44100u << 16);
 
 		// Default to highest supported values
 		audio_sample_rate_index = audio_sample_rates.size() - 1;
@@ -228,7 +228,7 @@ bool open_audio(void)
 void AudioInit(void)
 {
 	// Init audio status (reasonable defaults) and feature flags
-	AudioStatus.sample_rate = 44100 << 16;
+	AudioStatus.sample_rate = 44100u << 16;
 	AudioStatus.sample_size = 16;
 	AudioStatus.channels = 2;
 	AudioStatus.mixer = 0;

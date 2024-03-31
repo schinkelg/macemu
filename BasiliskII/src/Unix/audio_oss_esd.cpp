@@ -216,7 +216,7 @@ static bool open_esd(void)
 		// (if ESD fails, dsp might be tried next)
 		audio_sample_rates.push_back(11025 << 16);
 		audio_sample_rates.push_back(22050 << 16);
-		audio_sample_rates.push_back(44100 << 16);
+		audio_sample_rates.push_back(44100u << 16);
 		audio_sample_sizes.push_back(8);
 		audio_sample_sizes.push_back(16);
 		audio_channel_counts.push_back(1);
@@ -278,7 +278,7 @@ dev_opened:
 void AudioInit(void)
 {
 	// Init audio status (reasonable defaults) and feature flags
-	AudioStatus.sample_rate = 44100 << 16;
+	AudioStatus.sample_rate = 44100u << 16;
 	AudioStatus.sample_size = 16;
 	AudioStatus.channels = 2;
 	AudioStatus.mixer = 0;

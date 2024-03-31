@@ -69,7 +69,7 @@ void AudioInit(void)
 	char str[256];
 
 	// Init audio status and feature flags
-	audio_sample_rates.push_back(44100 << 16);
+	audio_sample_rates.push_back(44100u << 16);
 	audio_sample_sizes.push_back(16);
 	audio_channel_counts.push_back(2);
 	set_audio_status_format();
