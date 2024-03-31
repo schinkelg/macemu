@@ -134,14 +134,6 @@ static GtkWidget *make_browse_button(GtkWidget *entry, bool only_dirs)
 	return button;
 }
 
-static void add_menu_item(GtkWidget *menu, int label_id, GtkSignalFunc func)
-{
-	GtkWidget *item = gtk_menu_item_new_with_label(GetString(label_id));
-	gtk_widget_show(item);
-	g_signal_connect(item, "activate", func, NULL);
-	gtk_menu_append(GTK_MENU(menu), item);
-}
-
 static GtkWidget *make_pane(GtkWidget *notebook, int title_id)
 {
 	GtkWidget *frame, *label, *box;
@@ -565,7 +557,7 @@ static void cb_create_volume_response (GtkWidget *chooser, int response, GtkEntr
 							(GtkDialogFlags)(GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT),
 							GTK_MESSAGE_WARNING,
 							GTK_BUTTONS_CLOSE,
-							"Enter a valid size", NULL);
+							"Enter a valid size");
 			gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dialog), "The volume size should be between 1 and 2000.");
 			gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(chooser));
 			g_signal_connect(dialog, "response", G_CALLBACK(dl_quit), NULL);
@@ -1303,7 +1295,7 @@ static GList *add_serial_names(void)
 #else
 			if (false) {
 #endif
-				char *str = new char[64];
+				char *str = new char[261]; // 256 plus 5 for /dev/
 				sprintf(str, "/dev/%s", de->d_name);
 				glist = g_list_append(glist, str);
 			}
@@ -1451,11 +1443,13 @@ static void tb_idlewait(GtkWidget *widget)
 	PrefsReplaceBool("idlewait", GTK_TOGGLE_BUTTON(widget)->active);
 }
 
+#ifndef HAVE_SIGSEGV_SKIP_INSTRUCTION
 // "Ignore SEGV" button toggled
 static void tb_ignoresegv(GtkWidget *widget)
 {
 	PrefsReplaceBool("ignoresegv", GTK_TOGGLE_BUTTON(widget)->active);
 }
+#endif
 
 // Model ID selected
 static void mn_modelid(GtkWidget *widget)
@@ -1498,7 +1492,7 @@ static void read_memory_settings(void)
 // Create "Memory/Misc" pane
 static void create_memory_pane(GtkWidget *top)
 {
-	GtkWidget *box, *table, *w_ignoresegv;
+	GtkWidget *box, *table;
 
 	box = make_pane(top, STR_MEMORY_MISC_PANE_TITLE);
 	table = make_table(box, 2, 5);
@@ -1555,8 +1549,8 @@ static void create_memory_pane(GtkWidget *top)
 	w_rom_file = table_make_file_entry(table, 4, STR_ROM_FILE_CTRL, "rom");
 
 	make_checkbox(box, STR_IDLEWAIT_CTRL, "idlewait", G_CALLBACK(tb_idlewait));
-	w_ignoresegv = make_checkbox(box, STR_IGNORESEGV_CTRL, "ignoresegv", G_CALLBACK(tb_ignoresegv));
 #ifndef HAVE_SIGSEGV_SKIP_INSTRUCTION
+	GtkWidget w_ignoresegv = make_checkbox(box, STR_IGNORESEGV_CTRL, "ignoresegv", G_CALLBACK(tb_ignoresegv));
 	gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(w_ignoresegv), false);
 	gtk_widget_set_sensitive(w_ignoresegv, false);
 #endif
