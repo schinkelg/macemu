@@ -316,28 +316,6 @@ void SysAddFloppyPrefs(void)
 
 void SysAddDiskPrefs(void)
 {
-#ifdef __linux__
-	FILE *f = fopen("/etc/fstab", "r");
-	if (f) {
-		char line[256];
-		while(fgets(line, 255, f)) {
-			// Read line
-			int len = strlen(line);
-			if (len == 0 || line[0] == '#')
-				continue;
-			line[len-1] = 0;
-
-			// Parse line
-			char *dev = NULL, *mnt_point = NULL, *fstype = NULL;
-			if (sscanf(line, "%as %as %as", &dev, &mnt_point, &fstype) == 3) {
-				if (strcmp(fstype, "hfs") == 0)
-					PrefsAddString("disk", dev);
-			}
-			free(dev); free(mnt_point); free(fstype);
-		}
-		fclose(f);
-	}
-#endif
 }
 
 
@@ -494,30 +472,6 @@ void cdrom_close(mac_file_handle *fh)
 
 static bool is_drive_mounted(const char *dev_name, char *mount_name)
 {
-#ifdef __linux__
-	FILE *f = fopen("/proc/mounts", "r");
-	if (f) {
-		char line[256];
-		while(fgets(line, 255, f)) {
-			// Read line
-			int len = strlen(line);
-			if (len == 0)
-				continue;
-			line[len-1] = 0;
-
-			// Parse line
-			if (strncmp(line, dev_name, strlen(dev_name)) == 0) {
-				mount_name[0] = 0;
-				char *dummy;
-				sscanf(line, "%as %s", &dummy, mount_name);
-				free(dummy);
-				fclose(f);
-				return true;
-			}
-		}
-		fclose(f);
-	}
-#endif
 	return false;
 }
 
