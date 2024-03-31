@@ -162,7 +162,7 @@ static GtkWidget *make_pane(GtkWidget *notebook, int title_id)
 
 static GtkWidget *make_button_box(GtkWidget *top, int border, const opt_desc *buttons)
 {
-	GtkWidget *bb, *button;
+	GtkWidget *bb;
 
 	bb = gtk_hbutton_box_new();
 	gtk_widget_show(bb);
@@ -172,7 +172,7 @@ static GtkWidget *make_button_box(GtkWidget *top, int border, const opt_desc *bu
 	gtk_box_pack_start(GTK_BOX(top), bb, FALSE, FALSE, 0);
 
 	while (buttons->label_id) {
-		button = gtk_button_new_with_label(GetString(buttons->label_id));
+		GtkWidget *button = gtk_button_new_with_label(GetString(buttons->label_id));
 		gtk_widget_show(button);
 		g_signal_connect_object(button, "clicked", buttons->func, NULL, (GConnectFlags) 0);
 		gtk_box_pack_start(GTK_BOX(bb), button, TRUE, TRUE, 0);
@@ -428,7 +428,6 @@ static void dl_quit(GtkWidget *dialog)
 // "About" selected
 static void mn_about(...)
 {
-	GtkWidget *dialog, *label, *button;
 	const char *authors[] = {
 		"Christian Bauer",
 		"Orlando Bassotto",
@@ -1363,7 +1362,7 @@ static GList *add_ether_names(void)
 // Create "Serial/Network" pane
 static void create_serial_pane(GtkWidget *top)
 {
-	GtkWidget *box, *hbox, *table, *label, *combo, *sep;
+	GtkWidget *box, *hbox, *table, *label;
 	GtkObject *adj;
 	GList *glist = add_serial_names();
 
