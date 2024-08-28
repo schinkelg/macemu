@@ -44,14 +44,12 @@
 #include <SDL.h>
 #if SDL_VERSION_ATLEAST(3, 0, 0)
 
-#include <SDL_mutex.h>
-#include <SDL_thread.h>
 #include <errno.h>
 #include <vector>
 #include <string>
 #include <math.h>
 
-#ifdef __MACOS__
+#ifdef SDL_PLATFORM_MACOS
 #include "utils_macosx.h"
 #endif
 
@@ -85,19 +83,21 @@ static vector<VIDEO_MODE> VideoModes;
 #ifdef SHEEPSHAVER
 enum {
 	DISPLAY_WINDOW = DIS_WINDOW,					// windowed display
-	DISPLAY_SCREEN = DIS_SCREEN						// fullscreen display
+	DISPLAY_SCREEN = DIS_SCREEN,					// fullscreen display
+	DISPLAY_CHROMAKEY = DIS_CHROMAKEY
 };
 extern int display_type;							// See enum above
 #else
 enum {
 	DISPLAY_WINDOW,									// windowed display
-	DISPLAY_SCREEN									// fullscreen display
+	DISPLAY_SCREEN,									// fullscreen display
+	DISPLAY_CHROMAKEY
 };
 static int display_type = DISPLAY_WINDOW;			// See enum above
 #endif
 
 // Constants
-#if defined(__MACOS__) || defined(WIN32)
+#if defined(SDL_PLATFORM_MACOS) || defined(WIN32)
 const char KEYCODE_FILE_NAME[] = "keycodes";
 const char KEYCODE_FILE_NAME2[] = "BasiliskII_keycodes";
 #else
@@ -147,7 +147,7 @@ SDL_Window * sdl_window = NULL;				        // Wraps an OS-native window
 static SDL_Surface * host_surface = NULL;			// Surface in host-OS display format
 static SDL_Surface * guest_surface = NULL;			// Surface in guest-OS display format
 static SDL_Renderer * sdl_renderer = NULL;			// Handle to SDL2 renderer
-static SDL_threadID sdl_renderer_thread_id = 0;		// Thread ID where the SDL_renderer was created, and SDL_renderer ops should run (for compatibility w/ d3d9)
+static SDL_ThreadID sdl_renderer_thread_id = 0;		// Thread ID where the SDL_renderer was created, and SDL_renderer ops should run (for compatibility w/ d3d9)
 static SDL_Texture * sdl_texture = NULL;			// Handle to a GPU texture, with which to draw guest_surface to
 static SDL_Rect sdl_update_video_rect = {0,0,0,0};  // Union of all rects to update, when updating sdl_texture
 static SDL_Mutex * sdl_update_video_mutex = NULL;   // Mutex to protect sdl_update_video_rect
@@ -176,12 +176,6 @@ static SDL_Mutex *sdl_palette_lock = NULL;
 static SDL_Mutex *frame_buffer_lock = NULL;
 #define LOCK_FRAME_BUFFER SDL_LockMutex(frame_buffer_lock)
 #define UNLOCK_FRAME_BUFFER SDL_UnlockMutex(frame_buffer_lock)
-
-// Initially set gamma tables
-static uint16 init_gamma_red[256];
-static uint16 init_gamma_green[256];
-static uint16 init_gamma_blue[256];
-static bool init_gamma_valid;
 
 // Previously set gamma tables
 static uint16 last_gamma_red[256];
@@ -714,7 +708,7 @@ static int get_mag_rate()
 	return m < 1 ? 1 : m > 4 ? 4 : m;
 }
 
-static SDL_Surface * init_sdl_video(int width, int height, int depth, Uint32 flags, int pitch)
+static SDL_Surface *init_sdl_video(int width, int height, int depth, Uint32 flags, int pitch)
 {
     if (guest_surface) {
         delete_sdl_video_surfaces();
@@ -743,12 +737,18 @@ static SDL_Surface * init_sdl_video(int width, int height, int depth, Uint32 fla
 		}
 	}
 	
-#ifdef __MACOS__
+#ifdef SDL_PLATFORM_MACOS
 	if (MetalIsAvailable()) window_flags |= SDL_WINDOW_METAL;
 #endif
 	
 	if (!sdl_window) {
 		int m = get_mag_rate();
+#ifdef VIDEO_CHROMAKEY
+		if (display_type == DISPLAY_CHROMAKEY) {
+			window_flags |= SDL_WINDOW_BORDERLESS | SDL_WINDOW_TRANSPARENT;
+			SDL_SetHint("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1");
+		}
+#endif
 		sdl_window = SDL_CreateWindow(
 			"",
 			m * window_width,
@@ -760,7 +760,7 @@ static SDL_Surface * init_sdl_video(int width, int height, int depth, Uint32 fla
 		}
 		set_window_name();
 	}
-	if (flags & SDL_WINDOW_FULLSCREEN) SDL_SetWindowGrab(sdl_window, SDL_TRUE);
+//	if (flags & SDL_WINDOW_FULLSCREEN) SDL_SetWindowGrab(sdl_window, SDL_TRUE);
 	
 	// Some SDL events (regarding some native-window events), need processing
 	// as they are generated.  SDL2 has a facility, SDL_AddEventWatch(), which
@@ -778,7 +778,7 @@ static SDL_Surface * init_sdl_video(int width, int height, int depth, Uint32 fla
 		else {
 #ifdef WIN32
 			SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software");
-#elif defined(__MACOS__)
+#elif defined(SDL_PLATFORM_MACOS)
 			SDL_SetHint(SDL_HINT_RENDER_DRIVER, window_flags & SDL_WINDOW_METAL ? "metal" : "opengl");
 #else
 			SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
@@ -790,7 +790,7 @@ static SDL_Surface * init_sdl_video(int width, int height, int depth, Uint32 fla
 			SDL_SetHint(SDL_HINT_RENDER_VSYNC, "1");
 		}
 
-		sdl_renderer = SDL_CreateRenderer(sdl_window, NULL, 0);
+		sdl_renderer = SDL_CreateRenderer(sdl_window, NULL);
 
 		if (!sdl_renderer) {
 			shutdown_sdl_video();
@@ -798,10 +798,7 @@ static SDL_Surface * init_sdl_video(int width, int height, int depth, Uint32 fla
 		}
 		sdl_renderer_thread_id = SDL_ThreadID();
 
-		SDL_RendererInfo info;
-		memset(&info, 0, sizeof(info));
-		SDL_GetRendererInfo(sdl_renderer, &info);
-		printf("Using SDL_Renderer driver: %s\n", (info.name ? info.name : "(null)"));
+		printf("Using SDL_Renderer driver: %s\n", SDL_GetRendererName(sdl_renderer));
 	}
     
     if (!sdl_update_video_mutex) {
@@ -810,9 +807,9 @@ static SDL_Surface * init_sdl_video(int width, int height, int depth, Uint32 fla
 
 	SDL_assert(sdl_texture == NULL);
 #ifdef ENABLE_VOSF
-    sdl_texture = SDL_CreateTexture(sdl_renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, width, height);
+	sdl_texture = SDL_CreateTexture(sdl_renderer, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING, width, height);
 #else
-	sdl_texture = SDL_CreateTexture(sdl_renderer, SDL_PIXELFORMAT_BGRA8888, SDL_TEXTUREACCESS_STREAMING, width, height);
+	sdl_texture = SDL_CreateTexture(sdl_renderer, SDL_PIXELFORMAT_BGRX8888, SDL_TEXTUREACCESS_STREAMING, width, height);
 #endif
     if (!sdl_texture) {
         shutdown_sdl_video();
@@ -829,26 +826,26 @@ static SDL_Surface * init_sdl_video(int width, int height, int depth, Uint32 fla
 		case VIDEO_DEPTH_1BIT:
 		case VIDEO_DEPTH_2BIT:
 		case VIDEO_DEPTH_4BIT:
-            guest_surface = SDL_CreateSurface(width, height, SDL_GetPixelFormatEnumForMasks(8, 0, 0, 0, 0));
+            guest_surface = SDL_CreateSurface(width, height, SDL_GetPixelFormatForMasks(8, 0, 0, 0, 0));
             break;
 		case VIDEO_DEPTH_8BIT:
 #ifdef ENABLE_VOSF
-			guest_surface = SDL_CreateSurface(width, height, SDL_GetPixelFormatEnumForMasks(8, 0, 0, 0, 0));
+			guest_surface = SDL_CreateSurface(width, height, SDL_GetPixelFormatForMasks(8, 0, 0, 0, 0));
 #else
-			guest_surface = SDL_CreateSurfaceFrom(the_buffer, width, height, pitch, SDL_GetPixelFormatEnumForMasks(8, 0, 0, 0, 0));
+			guest_surface = SDL_CreateSurfaceFrom(width, height, SDL_GetPixelFormatForMasks(8, 0, 0, 0, 0), the_buffer, pitch);
 #endif
 			break;
 		case VIDEO_DEPTH_16BIT:
-			guest_surface = SDL_CreateSurface(width, height, SDL_GetPixelFormatEnumForMasks(16, 0xf800, 0x07e0, 0x001f, 0));
+			guest_surface = SDL_CreateSurface(width, height, SDL_GetPixelFormatForMasks(16, 0xf800, 0x07e0, 0x001f, 0));
 			break;
 		case VIDEO_DEPTH_32BIT:
 #ifdef ENABLE_VOSF
-			guest_surface = SDL_CreateSurface(width, height, SDL_GetPixelFormatEnumForMasks(32, 0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000));
+			guest_surface = SDL_CreateSurface(width, height, SDL_GetPixelFormatForMasks(32, 0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000));
 #else
-			guest_surface = SDL_CreateSurfaceFrom(the_buffer, width, height, pitch, SDL_GetPixelFormatEnumForMasks(32, 0xff000000, 0x00ff0000, 0x0000ff00, 0x000000ff));
+			guest_surface = SDL_CreateSurfaceFrom(width, height, SDL_GetPixelFormatForMasks(32, 0xff000000, 0x00ff0000, 0x0000ff00, 0x000000ff), the_buffer, pitch);
 #endif
 			host_surface = guest_surface;
-            break;
+			break;
         default:
             printf("WARNING: An unsupported depth of %d was used\n", depth);
             break;
@@ -859,22 +856,16 @@ static SDL_Surface * init_sdl_video(int width, int height, int depth, Uint32 fla
     }
 
     if (!host_surface) {
-    	Uint32 texture_format;
-    	if (SDL_QueryTexture(sdl_texture, &texture_format, NULL, NULL, NULL) != 0) {
-    		printf("ERROR: Unable to get the SDL texture's pixel format: %s\n", SDL_GetError());
-    		shutdown_sdl_video();
-    		return NULL;
-    	}
-
+		SDL_PropertiesID props = SDL_GetTextureProperties(sdl_texture);
+		SDL_PixelFormat texture_format = (SDL_PixelFormat)SDL_GetNumberProperty(props, SDL_PROP_TEXTURE_FORMAT_NUMBER, 0);
     	int bpp;
     	Uint32 Rmask, Gmask, Bmask, Amask;
-    	if (!SDL_GetMasksForPixelFormatEnum(texture_format, &bpp, &Rmask, &Gmask, &Bmask, &Amask)) {
+    	if (SDL_GetMasksForPixelFormat(texture_format, &bpp, &Rmask, &Gmask, &Bmask, &Amask)) {
     		printf("ERROR: Unable to determine format for host SDL_surface: %s\n", SDL_GetError());
     		shutdown_sdl_video();
     		return NULL;
     	}
-
-        host_surface = SDL_CreateSurface(width, height, SDL_GetPixelFormatEnumForMasks(bpp, Rmask, Gmask, Bmask, Amask));
+        host_surface = SDL_CreateSurface(width, height, SDL_GetPixelFormatForMasks(bpp, Rmask, Gmask, Bmask, Amask));
         if (!host_surface) {
         	printf("ERROR: Unable to create host SDL_surface: %s\n", SDL_GetError());
             shutdown_sdl_video();
@@ -937,22 +928,35 @@ static int present_sdl_video()
 	}
 	UNLOCK_PALETTE; // passed potential deadlock, can unlock palette
 	
-    // Update the host OS' texture
-    uint8_t *srcPixels = (uint8_t *)host_surface->pixels +
-        sdl_update_video_rect.y * host_surface->pitch +
-        sdl_update_video_rect.x * host_surface->format->BytesPerPixel;
+	// Update the host OS' texture
+	uint8_t *srcPixels = (uint8_t *)host_surface->pixels +
+		sdl_update_video_rect.y * host_surface->pitch +
+		sdl_update_video_rect.x * SDL_GetPixelFormatDetails(host_surface->format)->bytes_per_pixel;
 
 	uint8_t *dstPixels;
 	int dstPitch;
 	if (SDL_LockTexture(sdl_texture, &sdl_update_video_rect, (void **)&dstPixels, &dstPitch) < 0) {
-        SDL_UnlockMutex(sdl_update_video_mutex);
+		SDL_UnlockMutex(sdl_update_video_mutex);
 		return -1;
 	}
-	for (int y = 0; y < sdl_update_video_rect.h; y++) {
-		memcpy(dstPixels, srcPixels, sdl_update_video_rect.w << 2);
-		srcPixels += host_surface->pitch;
-		dstPixels += dstPitch;
-	}
+#ifdef VIDEO_CHROMAKEY
+	if (display_type == DISPLAY_CHROMAKEY)
+		for (int y = 0; y < sdl_update_video_rect.h; y++) {
+			uint32_t *src = (uint32_t *)srcPixels, *dst = (uint32_t *)dstPixels;
+			for (int i = 0; i < sdl_update_video_rect.w; i++) {
+				uint32 d = *src++;
+				*dst++ = d | (d == VIDEO_CHROMAKEY ? 0 : 0xff); // alpha value
+			}
+			srcPixels += host_surface->pitch;
+			dstPixels += dstPitch;
+		}
+	else
+#endif
+		for (int y = 0; y < sdl_update_video_rect.h; y++) {
+			memcpy(dstPixels, srcPixels, sdl_update_video_rect.w << 2);
+			srcPixels += host_surface->pitch;
+			dstPixels += dstPitch;
+		}
 	SDL_UnlockTexture(sdl_texture);
 
     // We are done working with pixels in host_surface.  Reset sdl_update_video_rect, then let
@@ -1092,7 +1096,7 @@ void driver_base::adapt_to_video_mode() {
 	ADBSetRelMouseMode(mouse_grabbed);
 
 	// Init blitting routines
-	SDL_PixelFormat *f = s->format;
+	const SDL_PixelFormatDetails *f = SDL_GetPixelFormatDetails(s->format);
 	VisualFormat visualFormat;
 	visualFormat.depth = sdl_depth_of_video_depth(VIDEO_MODE_DEPTH);
 	visualFormat.Rmask = f->Rmask;
@@ -1103,7 +1107,7 @@ void driver_base::adapt_to_video_mode() {
 	// Load gray ramp to 8->16/32 expand map
 	if (!IsDirectMode(mode))
 		for (int i=0; i<256; i++)
-			ExpandMap[i] = SDL_MapRGB(f, i, i, i);
+			ExpandMap[i] = SDL_MapRGB(f, NULL, i, i, i);
 
 
 	bool hardware_cursor = false;
@@ -1141,13 +1145,8 @@ driver_base::~driver_base()
 	ungrab_mouse();
 	restore_mouse_accel();
 
-	// HACK: Just delete instances of SDL_Surface and SDL_Texture, rather
-	// than also the SDL_Window and SDL_Renderer.  This fixes a bug whereby
-	// OSX hosts, when in fullscreen, will, on a guest OS resolution change,
-	// do a series of switches (using OSX's "Spaces" feature) to and from
-	// the Basilisk II desktop,
 	delete_sdl_video_surfaces();	// This deletes instances of SDL_Surface and SDL_Texture
-	//shutdown_sdl_video();			// This deletes SDL_Window, SDL_Renderer, in addition to
+	shutdown_sdl_video();			// This deletes SDL_Window, SDL_Renderer, in addition to
 									// instances of SDL_Surface and SDL_Texture.
 
 	// the_buffer shall always be mapped through vm_acquire_framebuffer()
@@ -1217,11 +1216,7 @@ void driver_base::toggle_mouse_grab(void)
 
 static void update_mouse_grab()
 {
-	if (mouse_grabbed) {
-		SDL_SetRelativeMouseMode(SDL_TRUE);
-	} else {
-		SDL_SetRelativeMouseMode(SDL_FALSE);
-	}
+	SDL_SetWindowRelativeMouseMode(sdl_window, mouse_grabbed ? SDL_TRUE : SDL_FALSE);
 }
 
 // Grab mouse, switch to relative mouse mode
@@ -1437,6 +1432,13 @@ bool VideoInit(bool classic)
 			display_type = DISPLAY_WINDOW;
 		else if (sscanf(mode_str, "dga/%d/%d", &default_width, &default_height) == 2)
 			display_type = DISPLAY_SCREEN;
+#ifdef VIDEO_CHROMAKEY
+		else if (strncmp(mode_str, "chromakey", 9) == 0) {
+			display_type = DISPLAY_CHROMAKEY;
+			default_width = sdl_display_width();
+			default_height = sdl_display_height();
+		}
+#endif
 	}
 	if (default_width <= 0)
 		default_width = sdl_display_width();
@@ -1517,7 +1519,7 @@ bool VideoInit(bool classic)
 					add_mode(display_type, w, h, video_modes[i].resolution_id, TrivialBytesPerRow(w, (video_depth)d), d);
 			}
 		}
-	} else if (display_type == DISPLAY_SCREEN) {
+	} else if (display_type == DISPLAY_SCREEN || display_type == DISPLAY_CHROMAKEY) {
 		for (int i = 0; video_modes[i].w != 0; i++) {
 			const int w = video_modes[i].w;
 			const int h = video_modes[i].h;
@@ -1675,14 +1677,14 @@ static void do_toggle_fullscreen(void)
 			int m = get_mag_rate();
 			SDL_SetWindowSize(sdl_window, m * VIDEO_MODE_X, m * VIDEO_MODE_Y);
 			//SDL_SetWindowGrab(sdl_window, SDL_FALSE);
-#ifndef __MACOS__
+#ifndef SDL_PLATFORM_MACOS
 			SDL_SetWindowPosition(sdl_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 #endif
 		} else {
 			display_type = DISPLAY_SCREEN;
 			SDL_SetWindowFullscreen(sdl_window, SDL_TRUE);
 			//SDL_SetWindowGrab(sdl_window, SDL_TRUE);
-#ifdef __MACOS__
+#ifdef SDL_PLATFORM_MACOS
 			set_menu_bar_visible_osx(false);
 #endif
 		}
@@ -1721,7 +1723,7 @@ static void do_toggle_fullscreen(void)
 
 static bool is_fullscreen(SDL_Window * window)
 {
-#ifdef __MACOS__
+#ifdef SDL_PLATFORM_MACOS
 	// On OSX, SDL, at least as of 2.0.5 (and possibly beyond), does not always
 	// report changes to fullscreen via the SDL_WINDOW_FULLSCREEN flag.
 	// (Example: https://bugzilla.libsdl.org/show_bug.cgi?id=3766 , which
@@ -1745,9 +1747,14 @@ void VideoVBL(void)
 	if (emerg_quit)
 		QuitEmulator();
 
+#ifdef VIDEO_CHROMAKEY
+	if (display_type == DISPLAY_CHROMAKEY)
+		make_window_transparent(sdl_window);
+	else
+#endif
 	if (toggle_fullscreen)
 		do_toggle_fullscreen();
-	
+
 	present_sdl_video();
 
 	// Temporarily give up frame buffer lock (this is the point where
@@ -1769,6 +1776,11 @@ void VideoInterrupt(void)
 	if (emerg_quit)
 		QuitEmulator();
 
+#ifdef VIDEO_CHROMAKEY
+	if (display_type == DISPLAY_CHROMAKEY)
+		make_window_transparent(sdl_window);
+	else
+#endif
 	if (toggle_fullscreen)
 		do_toggle_fullscreen();
 
@@ -1841,7 +1853,7 @@ void SDL_monitor_desc::set_palette(uint8 *pal, int num_in)
 	if (!IsDirectMode(mode)) {
 		for (int i=0; i<256; i++) {
 			int c = i & (num_in-1); // If there are less than 256 colors, we repeat the first entries (this makes color expansion easier)
-			ExpandMap[i] = SDL_MapRGB(drv->s->format, pal[c*3+0], pal[c*3+1], pal[c*3+2]);
+			ExpandMap[i] = SDL_MapRGB(SDL_GetPixelFormatDetails(drv->s->format), NULL, pal[c*3+0], pal[c*3+1], pal[c*3+2]);
 		}
 
 #ifdef ENABLE_VOSF
@@ -2056,13 +2068,13 @@ void video_set_cursor(void)
  *  Keyboard-related utilify functions
  */
 
-static bool is_hotkey_down(SDL_Keysym const & ks)
+static bool is_hotkey_down(SDL_KeyboardEvent const &key)
 {
 	int hotkey = PrefsFindInt32("hotkey");
 	if (!hotkey) hotkey = 1;
-	return (ctrl_down || (ks.mod & SDL_KMOD_CTRL) || !(hotkey & 1)) &&
-			(opt_down || (ks.mod & SDL_KMOD_ALT) || !(hotkey & 2)) &&
-			(cmd_down || (ks.mod & SDL_KMOD_GUI) || !(hotkey & 4));
+	return (ctrl_down || (key.mod & SDL_KMOD_CTRL) || !(hotkey & 1)) &&
+			(opt_down || (key.mod & SDL_KMOD_ALT) || !(hotkey & 2)) &&
+			(cmd_down || (key.mod & SDL_KMOD_GUI) || !(hotkey & 4));
 }
 
 static int modify_opt_cmd(int code) {
@@ -2085,35 +2097,35 @@ static int modify_opt_cmd(int code) {
  *  and CODE_HOTKEY if the key was recognized as a hotkey
  */
 
-static int kc_decode(SDL_Keysym const & ks, bool key_down)
+static int event2keycode(SDL_KeyboardEvent const &key, bool key_down)
 {
-	switch (ks.sym) {
-	case SDLK_a: return 0x00;
-	case SDLK_b: return 0x0b;
-	case SDLK_c: return 0x08;
-	case SDLK_d: return 0x02;
-	case SDLK_e: return 0x0e;
-	case SDLK_f: return 0x03;
-	case SDLK_g: return 0x05;
-	case SDLK_h: return 0x04;
-	case SDLK_i: return 0x22;
-	case SDLK_j: return 0x26;
-	case SDLK_k: return 0x28;
-	case SDLK_l: return 0x25;
-	case SDLK_m: return 0x2e;
-	case SDLK_n: return 0x2d;
-	case SDLK_o: return 0x1f;
-	case SDLK_p: return 0x23;
-	case SDLK_q: return 0x0c;
-	case SDLK_r: return 0x0f;
-	case SDLK_s: return 0x01;
-	case SDLK_t: return 0x11;
-	case SDLK_u: return 0x20;
-	case SDLK_v: return 0x09;
-	case SDLK_w: return 0x0d;
-	case SDLK_x: return 0x07;
-	case SDLK_y: return 0x10;
-	case SDLK_z: return 0x06;
+	switch (key.key) {
+	case SDLK_A: return 0x00;
+	case SDLK_B: return 0x0b;
+	case SDLK_C: return 0x08;
+	case SDLK_D: return 0x02;
+	case SDLK_E: return 0x0e;
+	case SDLK_F: return 0x03;
+	case SDLK_G: return 0x05;
+	case SDLK_H: return 0x04;
+	case SDLK_I: return 0x22;
+	case SDLK_J: return 0x26;
+	case SDLK_K: return 0x28;
+	case SDLK_L: return 0x25;
+	case SDLK_M: return 0x2e;
+	case SDLK_N: return 0x2d;
+	case SDLK_O: return 0x1f;
+	case SDLK_P: return 0x23;
+	case SDLK_Q: return 0x0c;
+	case SDLK_R: return 0x0f;
+	case SDLK_S: return 0x01;
+	case SDLK_T: return 0x11;
+	case SDLK_U: return 0x20;
+	case SDLK_V: return 0x09;
+	case SDLK_W: return 0x0d;
+	case SDLK_X: return 0x07;
+	case SDLK_Y: return 0x10;
+	case SDLK_Z: return 0x06;
 
 	case SDLK_1: case SDLK_EXCLAIM: return 0x12;
 	case SDLK_2: case SDLK_AT: return 0x13;
@@ -2126,20 +2138,20 @@ static int kc_decode(SDL_Keysym const & ks, bool key_down)
 	case SDLK_9: return 0x19;
 	case SDLK_0: return 0x1d;
 
-	case SDLK_BACKQUOTE: case 167: return 0x32;
+	case SDLK_GRAVE: case 167: return 0x32;
 	case SDLK_MINUS: case SDLK_UNDERSCORE: return 0x1b;
 	case SDLK_EQUALS: case SDLK_PLUS: return 0x18;
 	case SDLK_LEFTBRACKET: return 0x21;
 	case SDLK_RIGHTBRACKET: return 0x1e;
 	case SDLK_BACKSLASH: return 0x2a;
 	case SDLK_SEMICOLON: case SDLK_COLON: return 0x29;
-	case SDLK_QUOTE: case SDLK_QUOTEDBL: return 0x27;
+	case SDLK_APOSTROPHE: case SDLK_DBLAPOSTROPHE: return 0x27;
 	case SDLK_COMMA: case SDLK_LESS: return 0x2b;
 	case SDLK_PERIOD: case SDLK_GREATER: return 0x2f;
 	case SDLK_SLASH: case SDLK_QUESTION: return 0x2c;
 
-	case SDLK_TAB: if (is_hotkey_down(ks)) {if (!key_down) drv->suspend(); return CODE_HOTKEY;} else return 0x30;
-	case SDLK_RETURN: if (is_hotkey_down(ks)) {if (!key_down) toggle_fullscreen = true; return CODE_HOTKEY;} else return 0x24;
+	case SDLK_TAB: if (is_hotkey_down(key)) {if (!key_down) drv->suspend(); return CODE_HOTKEY;} else return 0x30;
+	case SDLK_RETURN: if (is_hotkey_down(key)) {if (!key_down) toggle_fullscreen = true; return CODE_HOTKEY;} else return 0x24;
 	case SDLK_SPACE: return 0x31;
 	case SDLK_BACKSPACE: return 0x33;
 
@@ -2165,9 +2177,9 @@ static int kc_decode(SDL_Keysym const & ks, bool key_down)
 	case SDLK_LEFT: return 0x3b;
 	case SDLK_RIGHT: return 0x3c;
 
-	case SDLK_ESCAPE: if (is_hotkey_down(ks)) {if (!key_down) { quit_full_screen = true; emerg_quit = true; } return CODE_HOTKEY;} else return 0x35;
+	case SDLK_ESCAPE: if (is_hotkey_down(key)) {if (!key_down) { quit_full_screen = true; emerg_quit = true; } return CODE_HOTKEY;} else return 0x35;
 
-	case SDLK_F1: if (is_hotkey_down(ks)) {if (!key_down) SysMountFirstFloppy(); return CODE_HOTKEY;} else return 0x7a;
+	case SDLK_F1: if (is_hotkey_down(key)) {if (!key_down) SysMountFirstFloppy(); return CODE_HOTKEY;} else return 0x7a;
 	case SDLK_F2: return 0x78;
 	case SDLK_F3: return 0x63;
 	case SDLK_F4: return 0x76;
@@ -2202,13 +2214,8 @@ static int kc_decode(SDL_Keysym const & ks, bool key_down)
 	case SDLK_KP_ENTER: return 0x4c;
 	case SDLK_KP_EQUALS: return 0x51;
 	}
-	D(bug("Unhandled SDL keysym: %d\n", ks.sym));
+	D(bug("Unhandled SDL keysym: %d\n", key.sym));
 	return CODE_INVALID;
-}
-
-static int event2keycode(SDL_KeyboardEvent const &ev, bool key_down)
-{
-	return kc_decode(ev.keysym, key_down);
 }
 
 static void force_complete_window_refresh()
@@ -2249,10 +2256,10 @@ static int SDLCALL on_sdl_event_generated(void *userdata, SDL_Event * event)
 {
 	switch (event->type) {
 		case SDL_EVENT_KEY_UP: {
-			SDL_Keysym const & ks = event->key.keysym;
-			switch (ks.sym) {
+			SDL_KeyboardEvent const &key = event->key;
+			switch (key.key) {
 				case SDLK_F5: {
-					if (is_hotkey_down(ks) && !PrefsFindBool("hardcursor")) {
+					if (is_hotkey_down(key) && !PrefsFindBool("hardcursor")) {
 						drv->toggle_mouse_grab();
 						return EVENT_DROP_FROM_QUEUE;
 					}
@@ -2316,6 +2323,17 @@ static void handle_events(void)
 							y = (y - (h - mag * VIDEO_MODE_Y) / 2) / mag;
 						}
 					}
+#ifdef VIDEO_CHROMAKEY
+					if (display_type == DISPLAY_CHROMAKEY) {
+						int xl, yl;
+						ADBGetPosition(xl, yl);
+						uint8 *p = (uint8 *)host_surface->pixels;
+						const int OFS = 2;
+						if (xl >= OFS) p += (xl - OFS) * SDL_GetPixelFormatDetails(host_surface->format)->bytes_per_pixel;
+						if (yl >= OFS) p += (yl - OFS) * host_surface->pitch;
+						set_mouse_ignore(sdl_window, *(uint32 *)p == VIDEO_CHROMAKEY);
+					}
+#endif
 					drv->mouse_moved(x, y);
 				}
 				break;
@@ -2342,7 +2360,7 @@ static void handle_events(void)
 					break;
 				int code = CODE_INVALID;
 				if (use_keycodes && event2keycode(event.key, true) != CODE_HOTKEY)
-					code = keycode_table[event.key.keysym.scancode & 0xff];
+					code = keycode_table[event.key.scancode & 0xff];
 				if (code == CODE_INVALID)
 					code = event2keycode(event.key, true);
 				if (code >= 0) {
@@ -2369,7 +2387,7 @@ static void handle_events(void)
 			case SDL_EVENT_KEY_UP: {
 				int code = CODE_INVALID;
 				if (use_keycodes && event2keycode(event.key, false) != CODE_HOTKEY)
-					code = keycode_table[event.key.keysym.scancode & 0xff];
+					code = keycode_table[event.key.scancode & 0xff];
 				if (code == CODE_INVALID)
 					code = event2keycode(event.key, false);
 				if (code >= 0) {
