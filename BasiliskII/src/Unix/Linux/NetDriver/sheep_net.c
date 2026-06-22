@@ -92,6 +92,24 @@
 MODULE_AUTHOR("Christian Bauer");
 MODULE_DESCRIPTION("Pseudo ethernet device for emulators");
 
+/*
+ * What this driver exposes:
+ *
+ * The emulator opens /dev/sheep_net and exchanges complete Ethernet frames
+ * with this module. The guest is given a fake Ethernet address (fake_addr),
+ * while frames put on the real wire use the attached NIC's hardware address
+ * (eth_addr). In other words, the module behaves like a small L2 masquerader:
+ *
+ *   guest -> write() -> demasquerade fake source MAC to real host NIC MAC
+ *   wire  -> receiver -> masquerade real destination MAC to fake guest MAC
+ *
+ * It does not NAT IP addresses or rewrite TCP/UDP ports. The only IP-level
+ * state is ipfilter, a host-byte-order IPv4 address used to decide which
+ * incoming IPv4 packets should be delivered to the emulator. That filter is
+ * learned from the sender-protocol-address field of outgoing ARP packets, or
+ * set explicitly by ioctl.
+ */
+
 /* Compatibility glue */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,0)
 #define LINUX_26
@@ -168,8 +186,8 @@ struct SheepVars {
 	struct sk_buff_head queue;	/* Receiver packet queue */
 	wait_queue_head_t wait;		/* Wait queue for blocking read operations */
 	u32 ipfilter;				/* Only receive IP packets destined for this address (host byte order) */
-	char eth_addr[6];			/* Hardware address of the Ethernet card */
-	char fake_addr[6];			/* Local faked hardware address (what SheepShaver sees) */
+	char eth_addr[6];			/* Real hardware address of the attached Ethernet card */
+	char fake_addr[6];			/* Synthetic hardware address presented to the emulator */
 #ifdef LINUX_3_15
 	atomic_t got_packet;
 #endif
@@ -338,8 +356,11 @@ static inline int is_fake_addr(struct SheepVars *v, void *a)
 }
 
 
-/* 
- * Outgoing packet. Replace the fake enet addr with the real local one.
+/*
+ * Outgoing packet from the emulator. The guest generated the Ethernet frame
+ * using fake_addr as its source MAC. Before putting it on the real interface,
+ * rewrite visible sender hardware addresses to eth_addr so the LAN sees the
+ * host NIC as the sender.
  */
 
 static inline void do_demasq(struct SheepVars *v, u8 *p)
@@ -354,13 +375,22 @@ static void demasquerade(struct SheepVars *v, struct sk_buff *skb)
 	
 	do_demasq(v, p + 6); /* source address */
 
-	/* Need to fix ARP packets */
+	/*
+	 * Ethernet header rewriting alone is not enough for ARP: ARP packets
+	 * also carry a sender hardware address inside the ARP payload. Keep the
+	 * sender protocol address (the guest's IPv4 address) untouched, but make
+	 * the sender hardware address match the real NIC MAC.
+	 */
 	if (proto == ETH_P_ARP) {
 		if (is_fake_addr(v, p + 14 + 8)) /* sender HW-addr */
 			do_demasq(v, p + 14 + 8);
 	}
 
-	/* ...and AARPs (snap code: 0x00,0x00,0x00,0x80,0xF3) */
+	/*
+	 * AppleTalk ARP has the same problem: the protocol payload contains a
+	 * sender hardware address. For SNAP-encoded AARP (OUI 00:00:00, type
+	 * 0x80f3), rewrite that embedded sender MAC too.
+	 */
 	if (p[17] == 0 && p[18] == 0 && p[19] == 0 && p[20] == 0x80 && p[21] == 0xf3) {
 		/* XXX: we should perhaps look for the 802 frame too */
 		if (is_fake_addr(v, p + 30))
@@ -370,7 +400,9 @@ static void demasquerade(struct SheepVars *v, struct sk_buff *skb)
 
 
 /*
- * Incoming packet. Replace the local enet addr with the fake one.
+ * Incoming packet to the emulator. If the frame is unicast to the real NIC,
+ * present it to userspace as if it had been unicast to fake_addr. Multicast
+ * and broadcast destinations are already group addresses, so leave them alone.
  */
 
 static inline void do_masq(struct SheepVars *v, u8 *p)
@@ -487,7 +519,11 @@ static ssize_t sheep_net_write(struct file *f, const char *buf, size_t count, lo
 	skb_set_network_header(skb, v->ether->hard_header_len);
 #endif
 
-	/* Base the IP-filtering on the IP address in any outgoing ARP packets */
+	/*
+	 * Learn the guest IPv4 address from outgoing ARP. In an Ethernet/IPv4
+	 * ARP packet, byte 14 starts the ARP payload and byte 14 inside that
+	 * payload is the sender protocol address. Store it in host byte order.
+	 */
 	if (eth_hdr(skb)->h_proto == htons(ETH_P_ARP)) {
 		u8 *p = &skb->data[14+14];	/* source IP address */
 		u32 ip = (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
@@ -497,14 +533,21 @@ static ssize_t sheep_net_write(struct file *f, const char *buf, size_t count, lo
 		}
 	}
 
-	/* Is this packet addressed solely to the local host? */
+	/*
+	 * If the emulator sends a unicast frame to the real host MAC, inject it
+	 * into the host receive path instead of sending it out to the wire.
+	 */
 	if (is_local_addr(v, skb->data) && !(skb->data[0] & ETH_ADDR_MULTICAST)) {
 		skb->destructor = do_nothing;
 		skb->protocol = eth_type_trans(skb, v->ether);
 		netif_rx(skb);
 		return count;
 	}
-	/* Relay multicast for host process except ARP packet */
+	/*
+	 * Multicast/broadcast traffic should be visible both to the LAN and to
+	 * host networking. ARP is excluded here so it is not looped back into the
+	 * host as if it had arrived from the network.
+	 */
 	if ((skb->data[0] & ETH_ADDR_MULTICAST) && (eth_hdr(skb)->h_proto != htons(ETH_P_ARP))) {
 		/* We can't clone the skb since we will manipulate the data below */
 		struct sk_buff *lskb = skb_copy(skb, GFP_ATOMIC);
@@ -518,7 +561,12 @@ static ssize_t sheep_net_write(struct file *f, const char *buf, size_t count, lo
 	demasquerade(v, skb);
 
 	skb->destructor = do_nothing;
-	skb->protocol = PROT_MAGIC;	/* Magic value (we can recognize the packet in sheep_net_receiver) */
+	/*
+	 * Mark frames we transmit ourselves. Since the receive hook listens for
+	 * ETH_P_ALL on the same device, the marker lets sheep_net_receiver drop
+	 * our own outgoing skb if the kernel feeds it back through the hook.
+	 */
+	skb->protocol = PROT_MAGIC;
 	dev_queue_xmit(skb);
 	return count;
 }
@@ -596,7 +644,11 @@ static int sheep_net_ioctl(struct inode *inode, struct file *f, unsigned int cod
 				goto error;
 			}
 
-			/* Remember the card's hardware address */
+			/*
+			 * Remember the real NIC MAC. Userspace sees fake_addr;
+			 * the physical network sees this eth_addr after outgoing
+			 * frames have been demasqueraded.
+			 */
 			memcpy(v->eth_addr, v->ether->dev_addr, 6);
 
 			/* Allocate socket */
@@ -614,7 +666,11 @@ static int sheep_net_ioctl(struct inode *inode, struct file *f, unsigned int cod
 			/*initialize ipfilter*/
 			v->ipfilter = 0;
 
-			/* Attach packet handler */
+			/*
+			 * Listen to every Ethernet protocol on the selected device.
+			 * Protocol-specific filtering is done later in
+			 * sheep_net_receiver.
+			 */
 			v->pt.type = htons(ETH_P_ALL);
 			v->pt.dev = v->ether;
 			v->pt.func = sheep_net_receiver;
@@ -707,6 +763,7 @@ error:
 			return put_user(v->ipfilter, (int *)arg);
 
 		case SIOC_MOL_SET_IPFILTER:
+			/* arg is expected to be a host-byte-order IPv4 address. */
 			v->ipfilter = arg;
 			return 0;
 
@@ -739,11 +796,19 @@ static int sheep_net_receiver(struct sk_buff *skb, struct net_device *dev, struc
 	multicast = (eth_hdr(skb)->h_dest[0] & ETH_ADDR_MULTICAST);
 	fake = is_fake_addr(v, &eth_hdr(skb)->h_dest);
 
-	/* Packet sent by us? Then discard */
+	/*
+	 * Drop frames that originated from this module. The source-MAC check
+	 * catches frames already using the synthetic MAC, while PROT_MAGIC
+	 * catches the skb we demasqueraded and queued for real transmission.
+	 */
 	if (is_fake_addr(v, &eth_hdr(skb)->h_source) || skb->protocol == PROT_MAGIC)
 		goto drop;
 
-	/* If the packet is not meant for this host, discard it */
+	/*
+	 * Accept only frames that make sense for the emulator: unicast to the
+	 * real host MAC, multicast/broadcast, or unicast directly to fake_addr
+	 * (for example if another local component already knows it).
+	 */
 	if (!is_local_addr(v, &eth_hdr(skb)->h_dest) && !multicast && !fake)
 		goto drop;
 
@@ -751,7 +816,16 @@ static int sheep_net_receiver(struct sk_buff *skb, struct net_device *dev, struc
 	if (skb_queue_len(&v->queue) > MAX_QUEUE)
 		goto drop;
 
-	/* Apply any filters here (if fake is true, then we *know* we want this packet) */
+	/*
+	 * Apply the IPv4 destination filter after the Ethernet address check.
+	 *
+	 * If the frame is already addressed to fake_addr, deliver it: that is an
+	 * explicit L2 match for the guest. Otherwise, for IPv4 unicast, deliver
+	 * only packets whose destination IPv4 address equals ipfilter. Multicast
+	 * IPv4 is allowed through because the destination IP is a group address,
+	 * not the guest's unicast address. Non-IPv4 protocols (ARP, AppleTalk,
+	 * etc.) are not filtered here.
+	 */
 	if (!fake) {
 		if ((skb->protocol == htons(ETH_P_IP))
 		 && (!v->ipfilter || (ntohl(ip_hdr(skb)->daddr) != v->ipfilter && !multicast))) {
@@ -775,7 +849,12 @@ static int sheep_net_receiver(struct sk_buff *skb, struct net_device *dev, struc
 #endif
 	}
 
-	/* Masquerade (we are typically a clone - best to make a real copy) */
+	/*
+	 * Hand userspace an owned copy with an Ethernet header and with unicast
+	 * destination MAC rewritten from the real NIC address to fake_addr. The
+	 * source MAC, EtherType, IP addresses, and higher-level protocol headers
+	 * are otherwise left as received.
+	 */
 	skb2 = skb_copy(skb, GFP_ATOMIC);
 	if (!skb2)
 		goto drop;
