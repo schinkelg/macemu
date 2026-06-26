@@ -846,16 +846,10 @@ yes|"guessing yes")
   ;;
 esac
 if [[ -n "$CAN_SLIRP" ]]; then
+  PKG_CHECK_MODULES([SLIRP], [slirp >= 4.0])
   AC_DEFINE(HAVE_SLIRP, 1, [Define if slirp library is supported])
-  SLIRP_SRCS="\
-    ../slirp/bootp.c     ../slirp/ip_output.c  ../slirp/tcp_input.c  \
-    ../slirp/cksum.c     ../slirp/mbuf.c       ../slirp/tcp_output.c \
-    ../slirp/debug.c     ../slirp/misc.c       ../slirp/tcp_subr.c   \
-    ../slirp/if.c        ../slirp/sbuf.c       ../slirp/tcp_timer.c  \
-    ../slirp/ip_icmp.c   ../slirp/slirp.c      ../slirp/tftp.c       \
-    ../slirp/ip_input.c  ../slirp/socket.c     ../slirp/udp.c"
+  LIBS="$LIBS $SLIRP_LIBS"
 fi
-AC_SUBST(SLIRP_SRCS)
 
 dnl Is libvdeplug available?
 have_vdeplug=no
@@ -1601,20 +1595,6 @@ if [[ "x$HAVE_GCC27" = "xyes" -a "x$HAVE_ICC" = "xno" ]]; then
   if [[ "x$ac_cv_gcc_store_motion" != "xyes" ]]; then
     CXXFLAGS="$SAVED_CXXFLAGS"
   fi
-fi
-
-dnl Add -fno-strict-aliasing for slirp sources
-if [[ "x$HAVE_GCC30" = "xyes" ]]; then
-  SAVED_CFLAGS="$CFLAGS"
-  CFLAGS="$CFLAGS -fno-strict-aliasing"
-  AC_CACHE_CHECK([whether the compiler supports -fno-strict-aliasing],
-    ac_cv_gcc_no_strict_aliasing, [
-    AC_TRY_COMPILE([],[],[ac_cv_gcc_no_strict_aliasing=yes],[ac_cv_gcc_no_strict_aliasing=no])
-  ])
-  if [[ "x$ac_cv_gcc_no_strict_aliasing" = "xyes" ]]; then
-    AC_SUBST(SLIRP_CFLAGS, "-fno-strict-aliasing")
-  fi
-  CFLAGS="$SAVED_CFLAGS"
 fi
 
 dnl Add -mdynamic-no-pic for MacOS X (XXX icc10 will support MacOS X)

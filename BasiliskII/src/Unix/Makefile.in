@@ -22,7 +22,7 @@ CFLAGS = @CFLAGS@
 CXXFLAGS = @CXXFLAGS@
 CPUINCLUDES_FLAGS=@CPUINCLUDES@
 CPUINCLUDES_FLAGS:=$(CPUINCLUDES_FLAGS:-I%=-I@top_srcdir@/%)
-CPPFLAGS = @CPPFLAGS@ -I@top_srcdir@/../include -I@top_srcdir@/. -I. -I@top_srcdir@/../CrossPlatform $(CPUINCLUDES_FLAGS) -I@top_srcdir@/../slirp
+CPPFLAGS = @CPPFLAGS@ $(SLIRP_CFLAGS) -I@top_srcdir@/../include -I@top_srcdir@/. -I. -I@top_srcdir@/../CrossPlatform $(CPUINCLUDES_FLAGS) -Wall -Wextra -fdiagnostics-format=json -fdiagnostics-show-option
 DEFS = @DEFS@ @DEFINES@ -D_REENTRANT -DDATADIR=\"$(datadir)/$(APP)\"
 LDFLAGS = @LDFLAGS@
 LIBS = @LIBS@
@@ -35,8 +35,6 @@ INSTALL_PROGRAM = @INSTALL_PROGRAM@
 INSTALL_DATA = @INSTALL_DATA@
 
 SLIRP_CFLAGS = @SLIRP_CFLAGS@
-SLIRP_SRCS = @SLIRP_SRCS@
-SLIRP_OBJS = $(SLIRP_SRCS:../slirp/%.c=obj/%.o)
 
 USE_BINCUE = @USE_BINCUE@
 
@@ -60,7 +58,7 @@ SRCS = ../main.cpp ../prefs.cpp ../prefs_items.cpp \
     ../audio.cpp ../extfs.cpp disk_sparsebundle.cpp \
 	tinyxml2.cpp \
     ../user_strings.cpp user_strings_unix.cpp sshpty.c strlcpy.c rpc_unix.cpp \
-    $(XPLAT_SRCS) $(SYSSRCS) $(CPUSRCS) $(SLIRP_SRCS)
+    $(XPLAT_SRCS) $(SYSSRCS) $(CPUSRCS)
 APP_FLAVOR ?=
 ifneq ($(APP_FLAVOR),)
 	CURR_APP_FLAVOR := -$(APP_FLAVOR)
@@ -194,8 +192,6 @@ depend dep:
 
 $(OBJ_DIR)/SDLMain.o : SDLMain.m
 	$(CC) $(CPPFLAGS) $(DEFS) $(CFLAGS) -c $< -o $@
-$(OBJ_DIR)/%.o : @top_srcdir@/../slirp/%.c
-	$(CC) $(CPPFLAGS) $(DEFS) $(CFLAGS) $(SLIRP_CFLAGS) -c $< -o $@
 $(OBJ_DIR)/%.o : %.c
 	$(CC) $(CPPFLAGS) $(DEFS) $(CFLAGS) -c $< -o $@
 $(OBJ_DIR)/%.o : %.cpp

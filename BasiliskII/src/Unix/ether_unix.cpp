@@ -70,6 +70,7 @@
 #include <signal.h>
 #include <map>
 #include <string>
+#include <vector>
 
 #if defined(__FreeBSD__) || defined (__sun__) || defined(sgi) || (defined(__APPLE__) && defined(__MACH__))
 #include <net/if.h>
@@ -86,8 +87,7 @@
 #endif
 
 #ifdef HAVE_SLIRP
-#include "libslirp.h"
-#include "ctl.h"
+#include <libslirp.h>
 #endif
 
 #ifdef HAVE_LIBVDEPLUG
@@ -106,6 +106,7 @@ extern "C" {
 
 #ifndef NO_STD_NAMESPACE
 using std::map;
+using std::vector;
 #endif
 
 #define DEBUG 0
@@ -151,6 +152,9 @@ static pthread_t slirp_thread;				// Slirp reception thread
 static bool slirp_thread_active = false;	// Flag: Slirp reception threadinstalled
 static int slirp_output_fd = -1;			// fd of slirp output pipe
 static int slirp_input_fds[2] = { -1, -1 };	// fds of slirp input pipe
+#ifdef HAVE_SLIRP
+static Slirp *slirp_stack = NULL;
+#endif
 #ifdef HAVE_LIBVDEPLUG
 static VDECONN *vde_conn;
 #endif
@@ -178,6 +182,13 @@ static int16 ether_do_write(uint32 arg);
 static void ether_do_interrupt(void);
 static void slirp_add_redirs();
 static int slirp_add_redir(const char *redir_str);
+#ifdef HAVE_SLIRP
+static bool slirp_init_stack();
+static void slirp_cleanup_stack();
+static slirp_ssize_t slirp_send_packet(const void *packet, size_t len, void *opaque);
+static void slirp_guest_error(const char *msg, void *opaque);
+static int64_t slirp_clock_get_ns(void *opaque);
+#endif
 
 #ifdef ENABLE_MACOSX_ETHERHELPER
 static int get_mac_address(const char* dev, unsigned char *addr);
@@ -344,7 +355,7 @@ bool ether_init(void)
 #ifdef HAVE_SLIRP
 	// Initialize slirp library
 	if (net_if_type == NET_IF_SLIRP) {
-		if (slirp_init() < 0) {
+		if (!slirp_init_stack()) {
 			sprintf(str, "%s", GetString(STR_SLIRP_NO_DNS_FOUND_WARN));
 			WarningAlert(str);
 			return false;
@@ -552,6 +563,9 @@ open_error:
 		close(slirp_output_fd);
 		slirp_output_fd = -1;
 	}
+#ifdef HAVE_SLIRP
+	slirp_cleanup_stack();
+#endif
 	return false;
 }
 
@@ -564,6 +578,9 @@ void ether_exit(void)
 {
 	// Stop reception threads
 	stop_thread();
+#ifdef HAVE_SLIRP
+	slirp_cleanup_stack();
+#endif
 
 	// Shut down TUN/TAP interface
 	if (net_if_type == NET_IF_TUNTAP)
@@ -960,14 +977,122 @@ void ether_stop_udp_thread(void)
  */
 
 #ifdef HAVE_SLIRP
-int slirp_can_output(void)
+static const char SLIRP_GUEST_ADDR[] = "10.0.2.15";
+
+struct SlirpPollfds {
+	vector<struct pollfd> fds;
+};
+
+static short slirp_to_poll_events(int events)
 {
-	return 1;
+	short poll_events = 0;
+	if (events & SLIRP_POLL_IN)
+		poll_events |= POLLIN;
+	if (events & SLIRP_POLL_OUT)
+		poll_events |= POLLOUT;
+	if (events & SLIRP_POLL_PRI)
+		poll_events |= POLLPRI;
+	if (events & SLIRP_POLL_ERR)
+		poll_events |= POLLERR;
+	if (events & SLIRP_POLL_HUP)
+		poll_events |= POLLHUP;
+	return poll_events;
 }
 
-void slirp_output(const uint8 *packet, int len)
+static int poll_to_slirp_events(short events)
 {
-	write(slirp_output_fd, packet, len);
+	int slirp_events = 0;
+	if (events & POLLIN)
+		slirp_events |= SLIRP_POLL_IN;
+	if (events & POLLOUT)
+		slirp_events |= SLIRP_POLL_OUT;
+	if (events & POLLPRI)
+		slirp_events |= SLIRP_POLL_PRI;
+	if (events & POLLERR)
+		slirp_events |= SLIRP_POLL_ERR;
+	if (events & POLLHUP)
+		slirp_events |= SLIRP_POLL_HUP;
+	return slirp_events;
+}
+
+static int slirp_add_poll_socket(slirp_os_socket fd, int events, void *opaque)
+{
+	SlirpPollfds *pollfds = (SlirpPollfds *)opaque;
+	struct pollfd pfd;
+	pfd.fd = fd;
+	pfd.events = slirp_to_poll_events(events);
+	pfd.revents = 0;
+	pollfds->fds.push_back(pfd);
+	return pollfds->fds.size() - 1;
+}
+
+static int slirp_get_revents(int idx, void *opaque)
+{
+	SlirpPollfds *pollfds = (SlirpPollfds *)opaque;
+	if (idx < 0 || (size_t)idx >= pollfds->fds.size())
+		return 0;
+	return poll_to_slirp_events(pollfds->fds[idx].revents);
+}
+
+static slirp_ssize_t slirp_send_packet(const void *packet, size_t len, void *opaque)
+{
+	ssize_t written = write(slirp_output_fd, packet, len);
+	return written < 0 ? -1 : written;
+}
+
+static void slirp_guest_error(const char *msg, void *opaque)
+{
+	D(bug("slirp guest error: %s\n", msg));
+}
+
+static int64_t slirp_clock_get_ns(void *opaque)
+{
+	return (int64_t)GetTicks_usec() * 1000;
+}
+
+static bool slirp_init_stack()
+{
+	SlirpConfig cfg;
+	SlirpCb cb;
+
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.version = SLIRP_CONFIG_VERSION_MAX;
+	cfg.in_enabled = true;
+	inet_aton("10.0.2.0", &cfg.vnetwork);
+	inet_aton("255.255.255.0", &cfg.vnetmask);
+	inet_aton("10.0.2.2", &cfg.vhost);
+	inet_aton(SLIRP_GUEST_ADDR, &cfg.vdhcp_start);
+	inet_aton("10.0.2.3", &cfg.vnameserver);
+
+	memset(&cb, 0, sizeof(cb));
+	cb.send_packet = slirp_send_packet;
+	cb.guest_error = slirp_guest_error;
+	cb.clock_get_ns = slirp_clock_get_ns;
+
+	slirp_stack = slirp_new(&cfg, &cb, NULL);
+	return slirp_stack != NULL;
+}
+
+static void slirp_cleanup_stack()
+{
+	if (slirp_stack) {
+		slirp_cleanup(slirp_stack);
+		slirp_stack = NULL;
+	}
+}
+
+static bool slirp_read_input_packet(int slirp_input_fd)
+{
+	int len;
+	uint8 packet[1516];
+
+	if (read(slirp_input_fd, &len, sizeof(len)) != sizeof(len))
+		return false;
+	assert(len <= (int)sizeof(packet));
+	if (read(slirp_input_fd, packet, len) != len)
+		return false;
+	slirp_input(slirp_stack, packet, len);
+	return true;
 }
 
 void *slirp_receive_func(void *arg)
@@ -976,37 +1101,28 @@ void *slirp_receive_func(void *arg)
 
 	for (;;) {
 		// Wait for packets to arrive
-		fd_set rfds, wfds, xfds;
-		int nfds;
-		struct timeval tv;
+		SlirpPollfds pollfds;
+		struct pollfd input_pfd;
+		uint32_t timeout = UINT32_MAX;
 
-		// ... in the input queue
-		FD_ZERO(&rfds);
-		FD_SET(slirp_input_fd, &rfds);
-		tv.tv_sec = 0;
-		tv.tv_usec = 0;
-		if (select(slirp_input_fd + 1, &rfds, NULL, NULL, &tv) > 0) {
-			int len;
-			read(slirp_input_fd, &len, sizeof(len));
-			uint8 packet[1516];
-			assert(len <= sizeof(packet));
-			read(slirp_input_fd, packet, len);
-			slirp_input(packet, len);
-		}
+		input_pfd.fd = slirp_input_fd;
+		input_pfd.events = POLLIN;
+		input_pfd.revents = 0;
+		pollfds.fds.push_back(input_pfd);
 
-		// ... in the output queue
-		nfds = -1;
-		FD_ZERO(&rfds);
-		FD_ZERO(&wfds);
-		FD_ZERO(&xfds);
-		int timeout = slirp_select_fill(&nfds, &rfds, &wfds, &xfds);
+		slirp_pollfds_fill_socket(slirp_stack, &timeout, slirp_add_poll_socket, &pollfds);
 #if ! USE_SLIRP_TIMEOUT
 		timeout = 10000;
 #endif
-		tv.tv_sec = 0;
-		tv.tv_usec = timeout;
-		if (select(nfds + 1, &rfds, &wfds, &xfds, &tv) >= 0)
-			slirp_select_poll(&rfds, &wfds, &xfds);
+		int poll_timeout = timeout == UINT32_MAX ? -1 : (int)timeout;
+		int poll_res = poll(&pollfds.fds[0], pollfds.fds.size(), poll_timeout);
+		if (poll_res >= 0) {
+			if (pollfds.fds[0].revents & POLLIN)
+				slirp_read_input_packet(slirp_input_fd);
+			slirp_pollfds_poll(slirp_stack, 0, slirp_get_revents, &pollfds);
+		} else {
+			slirp_pollfds_poll(slirp_stack, 1, slirp_get_revents, &pollfds);
+		}
 
 #ifdef HAVE_PTHREAD_TESTCANCEL
 		// Explicit cancellation point if select() was not covered
@@ -1015,15 +1131,6 @@ void *slirp_receive_func(void *arg)
 #endif
 	}
 	return NULL;
-}
-#else
-int slirp_can_output(void)
-{
-	return 0;
-}
-
-void slirp_output(const uint8 *packet, int len)
-{
 }
 #endif
 
@@ -1192,6 +1299,7 @@ static void slirp_add_redirs()
 static int slirp_add_redir(const char *redir_str)
 {
 	// code adapted from qemu source
+	struct in_addr host_addr = {0};
 	struct in_addr guest_addr = {0};
 	int host_port, guest_port;
 	const char *p;
@@ -1226,7 +1334,7 @@ static int slirp_add_redir(const char *redir_str)
 	// 0.0.0.0 doesn't seem to work, so default to a client address
 	// if none is specified
 	if (buf[0] == '\0' ?
-			!inet_aton(CTL_LOCAL, &guest_addr) :
+			!inet_aton(SLIRP_GUEST_ADDR, &guest_addr) :
 			!inet_aton(buf, &guest_addr)) {
 		goto fail_syntax;
 	}
@@ -1236,7 +1344,8 @@ static int slirp_add_redir(const char *redir_str)
 		goto fail_syntax;
 	}
 
-	if (slirp_redir(is_udp, host_port, guest_addr, guest_port) < 0) {
+	host_addr.s_addr = INADDR_ANY;
+	if (slirp_add_hostfwd(slirp_stack, is_udp, host_addr, host_port, guest_addr, guest_port) < 0) {
 		sprintf(str, "could not set up host forwarding rule '%s'", redir_str);
 		WarningAlert(str);
 		return -1;
