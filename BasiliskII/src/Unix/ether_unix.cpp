@@ -154,6 +154,7 @@ static int slirp_output_fd = -1;			// fd of slirp output pipe
 static int slirp_input_fds[2] = { -1, -1 };	// fds of slirp input pipe
 #ifdef HAVE_SLIRP
 static Slirp *slirp_stack = NULL;
+static int slirp_wake_fds[2] = { -1, -1 };	// fds used to wake slirp poll()
 #endif
 #ifdef HAVE_LIBVDEPLUG
 static VDECONN *vde_conn;
@@ -188,6 +189,13 @@ static void slirp_cleanup_stack();
 static slirp_ssize_t slirp_send_packet(const void *packet, size_t len, void *opaque);
 static void slirp_guest_error(const char *msg, void *opaque);
 static int64_t slirp_clock_get_ns(void *opaque);
+static void *slirp_timer_new(SlirpTimerCb cb, void *cb_opaque, void *opaque);
+static void *slirp_timer_new_opaque(SlirpTimerId id, void *cb_opaque, void *opaque);
+static void slirp_timer_free(void *timer, void *opaque);
+static void slirp_timer_mod(void *timer, int64_t expire_time, void *opaque);
+static void slirp_notify(void *opaque);
+static void slirp_register_poll_socket(slirp_os_socket socket, void *opaque);
+static void slirp_unregister_poll_socket(slirp_os_socket socket, void *opaque);
 #endif
 
 #ifdef ENABLE_MACOSX_ETHERHELPER
@@ -547,6 +555,9 @@ bool ether_init(void)
 open_error:
 	stop_thread();
 
+#ifdef HAVE_SLIRP
+	slirp_cleanup_stack();
+#endif
 	if (fd > 0) {
 		close(fd);
 		fd = -1;
@@ -563,9 +574,6 @@ open_error:
 		close(slirp_output_fd);
 		slirp_output_fd = -1;
 	}
-#ifdef HAVE_SLIRP
-	slirp_cleanup_stack();
-#endif
 	return false;
 }
 
@@ -978,10 +986,43 @@ void ether_stop_udp_thread(void)
 
 #ifdef HAVE_SLIRP
 static const char SLIRP_GUEST_ADDR[] = "10.0.2.15";
+static const int64_t SLIRP_TIMER_INACTIVE = -1;
+
+struct SlirpTimer {
+	SlirpTimerCb cb;
+	void *cb_opaque;
+	SlirpTimerId id;
+	bool use_opaque_id;
+	int64_t expire_time;
+};
 
 struct SlirpPollfds {
 	vector<struct pollfd> fds;
 };
+
+static vector<SlirpTimer *> slirp_timers;
+
+static void slirp_wake()
+{
+	if (slirp_wake_fds[1] >= 0) {
+		uint8 byte = 0;
+		write(slirp_wake_fds[1], &byte, sizeof(byte));
+	}
+}
+
+static void slirp_drain_wake()
+{
+	uint8 buf[64];
+	while (slirp_wake_fds[0] >= 0 && read(slirp_wake_fds[0], buf, sizeof(buf)) > 0)
+		;
+}
+
+static void slirp_set_nonblock(int fd)
+{
+	int flags = fcntl(fd, F_GETFL, 0);
+	if (flags >= 0)
+		fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
 
 static short slirp_to_poll_events(int events)
 {
@@ -1050,10 +1091,125 @@ static int64_t slirp_clock_get_ns(void *opaque)
 	return (int64_t)GetTicks_usec() * 1000;
 }
 
+static int64_t slirp_clock_get_ms()
+{
+	return (int64_t)(GetTicks_usec() / 1000);
+}
+
+static void *slirp_timer_new(SlirpTimerCb cb, void *cb_opaque, void *opaque)
+{
+	SlirpTimer *timer = new SlirpTimer;
+	timer->cb = cb;
+	timer->cb_opaque = cb_opaque;
+	timer->id = SLIRP_TIMER_RA;
+	timer->use_opaque_id = false;
+	timer->expire_time = SLIRP_TIMER_INACTIVE;
+	slirp_timers.push_back(timer);
+	return timer;
+}
+
+static void *slirp_timer_new_opaque(SlirpTimerId id, void *cb_opaque, void *opaque)
+{
+	SlirpTimer *timer = new SlirpTimer;
+	timer->cb = NULL;
+	timer->cb_opaque = cb_opaque;
+	timer->id = id;
+	timer->use_opaque_id = true;
+	timer->expire_time = SLIRP_TIMER_INACTIVE;
+	slirp_timers.push_back(timer);
+	return timer;
+}
+
+static void slirp_timer_free(void *timer, void *opaque)
+{
+	SlirpTimer *slirp_timer = (SlirpTimer *)timer;
+	for (vector<SlirpTimer *>::iterator it = slirp_timers.begin(); it != slirp_timers.end(); ++it) {
+		if (*it == slirp_timer) {
+			slirp_timers.erase(it);
+			break;
+		}
+	}
+	delete slirp_timer;
+}
+
+static void slirp_timer_mod(void *timer, int64_t expire_time, void *opaque)
+{
+	SlirpTimer *slirp_timer = (SlirpTimer *)timer;
+	slirp_timer->expire_time = expire_time;
+	slirp_wake();
+}
+
+static void slirp_notify(void *opaque)
+{
+	slirp_wake();
+}
+
+static void slirp_register_poll_socket(slirp_os_socket socket, void *opaque)
+{
+	slirp_wake();
+}
+
+static void slirp_unregister_poll_socket(slirp_os_socket socket, void *opaque)
+{
+	slirp_wake();
+}
+
+static void slirp_free_all_timers()
+{
+	for (vector<SlirpTimer *>::iterator it = slirp_timers.begin(); it != slirp_timers.end(); ++it)
+		delete *it;
+	slirp_timers.clear();
+}
+
+static void slirp_run_due_timers()
+{
+	for (;;) {
+		const int64_t now = slirp_clock_get_ms();
+		SlirpTimer *due_timer = NULL;
+
+		for (vector<SlirpTimer *>::iterator it = slirp_timers.begin(); it != slirp_timers.end(); ++it) {
+			SlirpTimer *timer = *it;
+			if (timer->expire_time != SLIRP_TIMER_INACTIVE && timer->expire_time <= now) {
+				due_timer = timer;
+				break;
+			}
+		}
+
+		if (!due_timer)
+			break;
+
+		due_timer->expire_time = SLIRP_TIMER_INACTIVE;
+		if (due_timer->use_opaque_id)
+			slirp_handle_timer(slirp_stack, due_timer->id, due_timer->cb_opaque);
+		else if (due_timer->cb)
+			due_timer->cb(due_timer->cb_opaque);
+	}
+}
+
+static void slirp_adjust_timeout_for_timers(uint32_t *timeout)
+{
+	const int64_t now = slirp_clock_get_ms();
+
+	for (vector<SlirpTimer *>::iterator it = slirp_timers.begin(); it != slirp_timers.end(); ++it) {
+		SlirpTimer *timer = *it;
+		if (timer->expire_time == SLIRP_TIMER_INACTIVE)
+			continue;
+
+		uint32_t timer_timeout = timer->expire_time <= now ? 0 : (uint32_t)(timer->expire_time - now);
+		if (*timeout == UINT32_MAX || timer_timeout < *timeout)
+			*timeout = timer_timeout;
+	}
+}
+
 static bool slirp_init_stack()
 {
 	SlirpConfig cfg;
 	SlirpCb cb;
+
+	if (pipe(slirp_wake_fds) < 0)
+		return false;
+	slirp_set_nonblock(slirp_wake_fds[0]);
+	slirp_set_nonblock(slirp_wake_fds[1]);
 
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.version = SLIRP_CONFIG_VERSION_MAX;
@@ -1068,9 +1224,20 @@ static bool slirp_init_stack()
 	cb.send_packet = slirp_send_packet;
 	cb.guest_error = slirp_guest_error;
 	cb.clock_get_ns = slirp_clock_get_ns;
+	cb.timer_new = slirp_timer_new;
+	cb.timer_free = slirp_timer_free;
+	cb.timer_mod = slirp_timer_mod;
+	cb.notify = slirp_notify;
+	cb.timer_new_opaque = slirp_timer_new_opaque;
+	cb.register_poll_socket = slirp_register_poll_socket;
+	cb.unregister_poll_socket = slirp_unregister_poll_socket;
 
 	slirp_stack = slirp_new(&cfg, &cb, NULL);
-	return slirp_stack != NULL;
+	if (!slirp_stack) {
+		slirp_cleanup_stack();
+		return false;
+	}
+	return true;
 }
 
 static void slirp_cleanup_stack()
@@ -1078,6 +1245,15 @@ static void slirp_cleanup_stack()
 	if (slirp_stack) {
 		slirp_cleanup(slirp_stack);
 		slirp_stack = NULL;
+	}
+	slirp_free_all_timers();
+	if (slirp_wake_fds[0] >= 0) {
+		close(slirp_wake_fds[0]);
+		slirp_wake_fds[0] = -1;
+	}
+	if (slirp_wake_fds[1] >= 0) {
+		close(slirp_wake_fds[1]);
+		slirp_wake_fds[1] = -1;
 	}
 }
 
@@ -1103,6 +1279,7 @@ void *slirp_receive_func(void *arg)
 		// Wait for packets to arrive
 		SlirpPollfds pollfds;
 		struct pollfd input_pfd;
+		struct pollfd wake_pfd;
 		uint32_t timeout = UINT32_MAX;
 
 		input_pfd.fd = slirp_input_fd;
@@ -1110,7 +1287,13 @@ void *slirp_receive_func(void *arg)
 		input_pfd.revents = 0;
 		pollfds.fds.push_back(input_pfd);
 
+		wake_pfd.fd = slirp_wake_fds[0];
+		wake_pfd.events = POLLIN;
+		wake_pfd.revents = 0;
+		pollfds.fds.push_back(wake_pfd);
+
 		slirp_pollfds_fill_socket(slirp_stack, &timeout, slirp_add_poll_socket, &pollfds);
+		slirp_adjust_timeout_for_timers(&timeout);
 #if ! USE_SLIRP_TIMEOUT
 		timeout = 10000;
 #endif
@@ -1119,6 +1302,9 @@ void *slirp_receive_func(void *arg)
 		if (poll_res >= 0) {
 			if (pollfds.fds[0].revents & POLLIN)
 				slirp_read_input_packet(slirp_input_fd);
+			if (pollfds.fds[1].revents & POLLIN)
+				slirp_drain_wake();
+			slirp_run_due_timers();
 			slirp_pollfds_poll(slirp_stack, 0, slirp_get_revents, &pollfds);
 		} else {
 			slirp_pollfds_poll(slirp_stack, 1, slirp_get_revents, &pollfds);
