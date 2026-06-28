@@ -622,7 +622,7 @@ bool PrefsEditor(void)
 	// Get screen dimensions
 #if GTK_CHECK_VERSION(3, 22, 0)
 	GdkMonitor *monitor = gdk_display_get_monitor(gdk_display_get_default(), 0);
-	GdkRectangle *geometry = new GdkRectangle;
+	GdkRectangle *geometry = g_new(GdkRectangle, 1);
 	gdk_monitor_get_geometry(monitor, geometry);
 	screen_width = geometry->width;
 	screen_height = geometry->height;
